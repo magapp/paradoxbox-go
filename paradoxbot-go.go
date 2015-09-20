@@ -6,6 +6,7 @@ import (
     "bufio"
     "io"
     "os"
+    "regexp"
     "strings"
     "io/ioutil"
     "encoding/json"
@@ -33,12 +34,18 @@ type Area struct {
   // State can be either of:
   // disarmed,armed,forcearmed,stayarmed,instantarmed
   State string
-  ZoneInMemory bool
-  Trouble bool
-  Active bool
-  InProgramming bool
-  Alarm bool
-  Strobe bool
+  InAlarm bool
+}
+
+type User struct {
+  Name string
+}
+
+type Zone struct {
+  Name string
+  // State can be either of:
+  // open,ok,tamper,fireloop
+  State string
 }
 
 func check(e error) {
@@ -67,7 +74,21 @@ func httpStatusArea(w http.ResponseWriter, r *http.Request, areas map[string]Are
     fmt.Fprintf(w, "%s", jsonString)
 }
 
-func paradoxWait(s io.ReadWriteCloser, areas *map[string]Area) string {
+func httpStatusUser(w http.ResponseWriter, r *http.Request, users map[string]User) {
+    w.Header().Set("Content-Type", "application/json")
+    jsonString, err := json.Marshal(users)
+    check(err)
+    fmt.Fprintf(w, "%s", jsonString)
+}
+
+func httpStatusZone(w http.ResponseWriter, r *http.Request, zones map[string]Zone) {
+    w.Header().Set("Content-Type", "application/json")
+    jsonString, err := json.Marshal(zones)
+    check(err)
+    fmt.Fprintf(w, "%s", jsonString)
+}
+
+func paradoxWait(s io.ReadWriteCloser, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
     ret_data := ""
     reader := bufio.NewReader(s)
     ret_data_bytes, err := reader.ReadBytes('\r')
@@ -78,8 +99,7 @@ func paradoxWait(s io.ReadWriteCloser, areas *map[string]Area) string {
         fmt.Printf("Got invalid: '%s'\n", ret_data)
         return ""
     }
-    // fmt.Printf("Got response: '%s'\n", ret_data)
-    paradoxParse(ret_data, areas)
+    paradoxParse(ret_data, areas, users, zones)
     return ret_data
 }
 
@@ -88,13 +108,13 @@ func paradoxSend(s io.ReadWriteCloser, data string) {
     check(err)
 }
 
-func paradoxSendAndWait(s io.ReadWriteCloser, data string, areas *map[string]Area) string {
+func paradoxSendAndWait(s io.ReadWriteCloser, data string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
     retry := 0
     max_retries := 5
     ret_data := ""
     for retry = 0; retry < max_retries; retry++ { 
         paradoxSend(s, data)
-        ret_data = paradoxWait(s, areas)
+        ret_data = paradoxWait(s, areas, users, zones)
         if len(ret_data) > 0 {
             break
         }
@@ -105,25 +125,97 @@ func paradoxSendAndWait(s io.ReadWriteCloser, data string, areas *map[string]Are
     return ret_data
 }
 
-func paradoxParse(event string, areas *map[string]Area) {
-    //fmt.Printf("heja -%s-\n", []byte(event)[0:1])
-    //var event = Event{}
-    //err := binary.Read([]byte(data), binary.BigEndian, &event)
-    //check(err)
-    //fmt.Printf("heja -%s-%s-%s-\n", event.Command, event.Group, event.Data)
-    //mt.Printf("heja -%s-\n", event[:2])
-    //cmd := event[:2]
-    //group := event[2:5]
-    // fmt.Printf("heja -%s-%s-\n", cmd, group)
+func emitEvent(event string, name string, label string) {
+    fmt.Printf("EmitEvent: event: '%s' name: '%s', label '%s'\n", event, name, label)
+    match, _ := regexp.MatchString("G001N036A001", event)
+}
+
+func paradoxParse(event string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) {
 
     if event[:2] == "AL" { // Area Label
         (*areas)[event[2:5]] = Area{Name: event[5:]}
-    }
-    if event[:2] == "RA" { // Area status
-        // (*areas)[event[2:5]] = Area{Name: event[5:]}
-        
+    } else if event[:2] == "RA" { // Area status
+        area := (*areas)[event[2:5]]
+        state := "" 
+        inAlarm := true
+        switch event[5] {
+            case 'D':
+                state = "disarmed"
+            case 'A':
+                state = "armed"
+            case 'F':
+                state = "forcearmed"
+            case 'S':
+                state = "stayarmed"
+            case 'I':
+                state = "instantarmed"
+        }
+        if state != area.State {
+            area.State = state
+            emitEvent(event, area.State, area.Name)
+        }
+        switch event[10] {
+            case 'A':
+                inAlarm = true
+            case 'O':
+                inAlarm = false
+        }
+        if inAlarm != area.InAlarm {
+            area.InAlarm = inAlarm
+            if area.InAlarm {
+                emitEvent(event, "alarm", area.Name)
+            } else {
+                emitEvent(event, "ok", area.Name)
+            }
+        }
+        (*areas)[event[2:5]] = area
+
+    } else if event[:2] == "UL" && event[5:] != fmt.Sprintf("User %s", event[2:5]) { // User label
+        (*users)[event[2:5]] = User{Name: event[5:]}
+
+    } else if event[:2] == "ZL" && event[5:] != fmt.Sprintf("Zone %s", event[2:5]) { // Zone Label
+        (*zones)[event[2:5]] = Zone{Name: event[5:]}
+
+    } else if event[:2] == "RZ" && len((*zones)[event[2:5]].Name) > 0 {
+        // only zones with a name are valid
+        zone := (*zones)[event[2:5]]
+        state := "" 
+        switch event[5] {
+            case 'O':
+                state = "open"
+            case 'C':
+                state = "ok"
+            case 'T':
+                state = "tamper"
+            case 'F':
+                state = "fireloop"
+        }
+        if state != zone.State {
+            fmt.Printf("NEW EVENT zone, change state\n")
+            zone.State = state
+            emitEvent(event, zone.State, zone.Name)
+        }
+        (*zones)[event[2:5]] = zone
+    } else if string(event[0]) == "G" && event[1:4] == "000" {
+        // event OK
+        zone := (*zones)[event[5:8]]
+        zone.State = "ok"
+        (*zones)[event[5:8]] = zone
+        emitEvent(event, zone.State, zone.Name)
+    } else if string(event[0]) == "G" && event[1:4] == "001" {
+        // event Open
+        zone := (*zones)[event[5:8]]
+        zone.State = "open"
+        (*zones)[event[5:8]] = zone
+        emitEvent(event, zone.State, zone.Name)
+    } else if string(event[0]) == "G" && event[1:4] == "002" {
+        // event Tamper
+        zone := (*zones)[event[5:8]]
+        zone.State = "tamper"
+        (*zones)[event[5:8]] = zone
+        emitEvent(event, zone.State, zone.Name)
     } else {
-        fmt.Printf("Got: '%s'\n", event)
+        fmt.Printf("Got unknown: '%s'\n", event)
     }
 }
 
@@ -132,6 +224,8 @@ func main() {
 
     var config = Config{Baud: 57600, TcpPort: 3001, MaxUsers: 25, MaxAreas: 3, MaxZones: 100}
     var areas = make(map[string]Area)
+    var users = make(map[string]User)
+    var zones = make(map[string]Zone)
     
 
     yamlFile, err := ioutil.ReadFile(paradoxbot_yaml)
@@ -151,21 +245,21 @@ func main() {
     check(err)
 
     fmt.Printf("Detecting Paradox...\n")
-    if !strings.Contains(paradoxSendAndWait(s, "RA001", &areas), "RA001") {
+    if !strings.Contains(paradoxSendAndWait(s, "RA001", &areas, &users, &zones), "RA001") {
         fmt.Printf("Can't find Paradox on that port, exit.\n")
         os.Exit(-1)
     }
 
     fmt.Printf("Reading zones...\n")
     for i := 1; i < (config.MaxZones + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("ZL%03d", i), &areas)
-        paradoxSendAndWait(s, fmt.Sprintf("RZ%03d", i), &areas)
+        paradoxSendAndWait(s, fmt.Sprintf("ZL%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(s, fmt.Sprintf("RZ%03d", i), &areas, &users, &zones)
     }
 
     fmt.Printf("Reading areas... ")
     for i := 1; i < (config.MaxAreas + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("AL%03d", i), &areas)
-        paradoxSendAndWait(s, fmt.Sprintf("RA%03d", i), &areas)
+        paradoxSendAndWait(s, fmt.Sprintf("AL%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(s, fmt.Sprintf("RA%03d", i), &areas, &users, &zones)
     }
  
     for _, area_info := range areas {
@@ -175,7 +269,7 @@ func main() {
 
     fmt.Printf("Reading users...\n")
     for i := 1; i < (config.MaxUsers + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("UL%03d", i), &areas)
+        paradoxSendAndWait(s, fmt.Sprintf("UL%03d", i), &areas, &users, &zones)
     }
  
     s.Close()
@@ -189,10 +283,7 @@ func main() {
     go func() {
         for {
             time.Sleep(25 * time.Millisecond)
-            paradoxWait(s, &areas)
-            // if len(ret_data) > 0 {
-                // fmt.Printf("Got: '%s'\n", ret_data)
-            // }
+            paradoxWait(s, &areas, &users, &zones)
         }
     }()
 
@@ -211,6 +302,12 @@ func main() {
     http.HandleFunc("/", httpServe)
     http.HandleFunc("/status-area", func(w http.ResponseWriter, r *http.Request) {
         httpStatusArea(w, r, areas)
+    })
+    http.HandleFunc("/status-user", func(w http.ResponseWriter, r *http.Request) {
+        httpStatusUser(w, r, users)
+    })
+    http.HandleFunc("/status-zone", func(w http.ResponseWriter, r *http.Request) {
+        httpStatusZone(w, r, zones)
     })
     err = http.ListenAndServe(fmt.Sprint(":", config.TcpPort), nil)
     check(err)
