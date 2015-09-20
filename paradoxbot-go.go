@@ -22,6 +22,7 @@ type Config struct {
         MaxUsers int `yaml:"max_users"`
         MaxAreas int `yaml:"max_areas"`
         MaxZones int `yaml:"max_zones"`
+        Debug bool `yaml:"debug"`
         Webhooks[] struct {
             Event string
             Description string
@@ -88,7 +89,7 @@ func httpStatusZone(w http.ResponseWriter, r *http.Request, zones map[string]Zon
     fmt.Fprintf(w, "%s", jsonString)
 }
 
-func paradoxWait(s io.ReadWriteCloser, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
+func paradoxWait(config Config, s io.ReadWriteCloser, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
     ret_data := ""
     reader := bufio.NewReader(s)
     ret_data_bytes, err := reader.ReadBytes('\r')
@@ -96,10 +97,12 @@ func paradoxWait(s io.ReadWriteCloser, areas *map[string]Area, users *map[string
     ret_data = strings.TrimSpace(string(ret_data_bytes))
 
     if strings.Contains(ret_data, "fail") || len(ret_data) < 4 {
-        fmt.Printf("Got invalid: '%s'\n", ret_data)
+        if config.Debug {
+            fmt.Printf("Got invalid: '%s'\n", ret_data)
+        }
         return ""
     }
-    paradoxParse(ret_data, areas, users, zones)
+    paradoxParse(config, ret_data, areas, users, zones)
     return ret_data
 }
 
@@ -108,13 +111,13 @@ func paradoxSend(s io.ReadWriteCloser, data string) {
     check(err)
 }
 
-func paradoxSendAndWait(s io.ReadWriteCloser, data string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
+func paradoxSendAndWait(config Config, s io.ReadWriteCloser, data string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) string {
     retry := 0
     max_retries := 5
     ret_data := ""
     for retry = 0; retry < max_retries; retry++ { 
         paradoxSend(s, data)
-        ret_data = paradoxWait(s, areas, users, zones)
+        ret_data = paradoxWait(config, s, areas, users, zones)
         if len(ret_data) > 0 {
             break
         }
@@ -125,13 +128,19 @@ func paradoxSendAndWait(s io.ReadWriteCloser, data string, areas *map[string]Are
     return ret_data
 }
 
-func emitEvent(event string, name string, label string) {
-    fmt.Printf("EmitEvent: event: '%s' name: '%s', label '%s'\n", event, name, label)
-    match, _ := regexp.MatchString("G001N036A001", event)
+func emitEvent(config Config, event string, name string, label string) {
+    if config.Debug {
+        fmt.Printf("EmitEvent: event: '%s' name: '%s', label '%s'\n", event, name, label)
+    }
+    for _,webhook := range config.Webhooks {
+        match, _ := regexp.MatchString(webhook.Event, event)
+        if match {
+            fmt.Printf("Match: '%s'\n", webhook.Description)
+        }
+    }
 }
 
-func paradoxParse(event string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone) {
-
+func paradoxParse(config Config, event string, areas *map[string]Area, users *map[string]User, zones *map[string]Zone){
     if event[:2] == "AL" { // Area Label
         (*areas)[event[2:5]] = Area{Name: event[5:]}
     } else if event[:2] == "RA" { // Area status
@@ -152,7 +161,7 @@ func paradoxParse(event string, areas *map[string]Area, users *map[string]User, 
         }
         if state != area.State {
             area.State = state
-            emitEvent(event, area.State, area.Name)
+            emitEvent(config, event, area.State, area.Name)
         }
         switch event[10] {
             case 'A':
@@ -163,9 +172,9 @@ func paradoxParse(event string, areas *map[string]Area, users *map[string]User, 
         if inAlarm != area.InAlarm {
             area.InAlarm = inAlarm
             if area.InAlarm {
-                emitEvent(event, "alarm", area.Name)
+                emitEvent(config, event, "alarm", area.Name)
             } else {
-                emitEvent(event, "ok", area.Name)
+                emitEvent(config, event, "ok", area.Name)
             }
         }
         (*areas)[event[2:5]] = area
@@ -191,9 +200,8 @@ func paradoxParse(event string, areas *map[string]Area, users *map[string]User, 
                 state = "fireloop"
         }
         if state != zone.State {
-            fmt.Printf("NEW EVENT zone, change state\n")
             zone.State = state
-            emitEvent(event, zone.State, zone.Name)
+            emitEvent(config, event, zone.State, zone.Name)
         }
         (*zones)[event[2:5]] = zone
     } else if string(event[0]) == "G" && event[1:4] == "000" {
@@ -201,28 +209,30 @@ func paradoxParse(event string, areas *map[string]Area, users *map[string]User, 
         zone := (*zones)[event[5:8]]
         zone.State = "ok"
         (*zones)[event[5:8]] = zone
-        emitEvent(event, zone.State, zone.Name)
+        emitEvent(config, event, zone.State, zone.Name)
     } else if string(event[0]) == "G" && event[1:4] == "001" {
         // event Open
         zone := (*zones)[event[5:8]]
         zone.State = "open"
         (*zones)[event[5:8]] = zone
-        emitEvent(event, zone.State, zone.Name)
+        emitEvent(config, event, zone.State, zone.Name)
     } else if string(event[0]) == "G" && event[1:4] == "002" {
         // event Tamper
         zone := (*zones)[event[5:8]]
         zone.State = "tamper"
         (*zones)[event[5:8]] = zone
-        emitEvent(event, zone.State, zone.Name)
+        emitEvent(config, event, zone.State, zone.Name)
     } else {
-        fmt.Printf("Got unknown: '%s'\n", event)
+        if config.Debug {
+            fmt.Printf("Got unknown: '%s'\n", event)
+        }
     }
 }
 
 func main() {
     var paradoxbot_yaml = "/etc/paradoxbot.yaml"
 
-    var config = Config{Baud: 57600, TcpPort: 3001, MaxUsers: 25, MaxAreas: 3, MaxZones: 100}
+    config := Config{Baud: 57600, TcpPort: 3001, MaxUsers: 25, MaxAreas: 3, MaxZones: 100, Debug: false}
     var areas = make(map[string]Area)
     var users = make(map[string]User)
     var zones = make(map[string]Zone)
@@ -245,21 +255,21 @@ func main() {
     check(err)
 
     fmt.Printf("Detecting Paradox...\n")
-    if !strings.Contains(paradoxSendAndWait(s, "RA001", &areas, &users, &zones), "RA001") {
+    if !strings.Contains(paradoxSendAndWait(config, s, "RA001", &areas, &users, &zones), "RA001") {
         fmt.Printf("Can't find Paradox on that port, exit.\n")
         os.Exit(-1)
     }
 
     fmt.Printf("Reading zones...\n")
     for i := 1; i < (config.MaxZones + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("ZL%03d", i), &areas, &users, &zones)
-        paradoxSendAndWait(s, fmt.Sprintf("RZ%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(config, s, fmt.Sprintf("ZL%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(config, s, fmt.Sprintf("RZ%03d", i), &areas, &users, &zones)
     }
 
     fmt.Printf("Reading areas... ")
     for i := 1; i < (config.MaxAreas + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("AL%03d", i), &areas, &users, &zones)
-        paradoxSendAndWait(s, fmt.Sprintf("RA%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(config, s, fmt.Sprintf("AL%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(config, s, fmt.Sprintf("RA%03d", i), &areas, &users, &zones)
     }
  
     for _, area_info := range areas {
@@ -269,7 +279,7 @@ func main() {
 
     fmt.Printf("Reading users...\n")
     for i := 1; i < (config.MaxUsers + 1); i++ { 
-        paradoxSendAndWait(s, fmt.Sprintf("UL%03d", i), &areas, &users, &zones)
+        paradoxSendAndWait(config, s, fmt.Sprintf("UL%03d", i), &areas, &users, &zones)
     }
  
     s.Close()
@@ -283,7 +293,7 @@ func main() {
     go func() {
         for {
             time.Sleep(25 * time.Millisecond)
-            paradoxWait(s, &areas, &users, &zones)
+            paradoxWait(config, s, &areas, &users, &zones)
         }
     }()
 
