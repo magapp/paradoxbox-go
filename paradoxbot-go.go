@@ -23,11 +23,16 @@ type Config struct {
         MaxAreas int `yaml:"max_areas"`
         MaxZones int `yaml:"max_zones"`
         Debug bool `yaml:"debug"`
+        Startup bool 
         Webhooks[] struct {
             Event string
             Description string
             Url string
         } `yaml:"webhooks"`
+        Macros[] struct {
+            Name string
+            Value string
+        } `yaml:"macros"`
 }
 
 type Area struct {
@@ -128,14 +133,28 @@ func paradoxSendAndWait(config Config, s io.ReadWriteCloser, data string, areas 
     return ret_data
 }
 
+func replaceMacros(config Config, s string, event string, name string, label string) string {
+    new_s := s
+    new_s = strings.Replace(new_s, "${EVENT}", event, -1)  		 
+    new_s = strings.Replace(new_s, "${NAME}", name, -1)  		 
+    new_s = strings.Replace(new_s, "${LABEL}", label, -1)  		 
+
+    for _, macro := range config.Macros {
+        new_s = strings.Replace(new_s, fmt.Sprintf("${%s}", macro.Name), macro.Value, -1)
+    }
+    return new_s
+}
+
 func emitEvent(config Config, event string, name string, label string) {
+    // Replace ${LABEL}, ${EVENT}, ${NAME} and all macros in config file.
+
     if config.Debug {
-        fmt.Printf("EmitEvent: event: '%s' name: '%s', label '%s'\n", event, name, label)
+        fmt.Printf("%s EmitEvent: event: '%s' name: '%s', label '%s'\n", time.Now().Format("2006-01-02 15:04:05"), event, name, label)
     }
     for _,webhook := range config.Webhooks {
         match, _ := regexp.MatchString(webhook.Event, event)
-        if match {
-            fmt.Printf("Match: '%s'\n", webhook.Description)
+        if match && !config.Startup {
+            fmt.Printf("%s Match: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), replaceMacros(config, webhook.Description, event, name, label))
         }
     }
 }
@@ -222,17 +241,55 @@ func paradoxParse(config Config, event string, areas *map[string]Area, users *ma
         zone.State = "tamper"
         (*zones)[event[5:8]] = zone
         emitEvent(config, event, zone.State, zone.Name)
-    } else {
-        if config.Debug {
-            fmt.Printf("Got unknown: '%s'\n", event)
+    } else if string(event[0]) == "G" && event[1:4] == "005" {
+        // User code
+        user := (*users)[event[5:8]]
+        emitEvent(config, event, "usercode", user.Name)
+    } else if string(event[0]) == "G" && event[1:4] == "006" {
+        // User card/code door access
+        emitEvent(config, event, "door", event[5:8])
+    } else if string(event[0]) == "G" && event[1:4] == "012" {
+        // Special arming
+        switch event[5:8] {
+            case "000":
+                emitEvent(config, event, "specialarm", "autoarm")
+            case "001":
+                emitEvent(config, event, "specialarm", "winload")
+            case "002":
+                emitEvent(config, event, "specialarm", "lateclose")
+            case "003":
+                emitEvent(config, event, "specialarm", "nomove")
+            case "004":
+                emitEvent(config, event, "specialarm", "partial")
+            case "005":
+                emitEvent(config, event, "specialarm", "onetouch")
+            case "006":
+                emitEvent(config, event, "specialarm", "future")
+            case "007":
+                emitEvent(config, event, "specialarm", "future")
+            case "008":
+                emitEvent(config, event, "specialarm", "voice")
         }
+    } else if string(event[0]) == "G" && event[1:4] == "014" {
+        // Disarm user code
+        user := (*users)[event[5:8]]
+        emitEvent(config, event, "disarmuser", user.Name)
+    } else if string(event[0]) == "G" && event[1:4] == "024" {
+        // Zone in Alarm
+        zone := (*zones)[event[5:8]]
+        emitEvent(config, event, "alarm", zone.Name)
+    } else {
+        emitEvent(config, event, "unknown", "unknown")
+        // if config.Debug {
+            // fmt.Printf("Got unknown: '%s'\n", event)
+        // }
     }
 }
 
 func main() {
     var paradoxbot_yaml = "/etc/paradoxbot.yaml"
 
-    config := Config{Baud: 57600, TcpPort: 3001, MaxUsers: 25, MaxAreas: 3, MaxZones: 100, Debug: false}
+    config := Config{Startup: true, Baud: 57600, TcpPort: 3001, MaxUsers: 25, MaxAreas: 3, MaxZones: 100, Debug: false}
     var areas = make(map[string]Area)
     var users = make(map[string]User)
     var zones = make(map[string]Zone)
@@ -260,13 +317,14 @@ func main() {
         os.Exit(-1)
     }
 
-    fmt.Printf("Reading zones...\n")
+    fmt.Printf("Reading zones... ")
     for i := 1; i < (config.MaxZones + 1); i++ { 
         paradoxSendAndWait(config, s, fmt.Sprintf("ZL%03d", i), &areas, &users, &zones)
         paradoxSendAndWait(config, s, fmt.Sprintf("RZ%03d", i), &areas, &users, &zones)
     }
+    fmt.Printf("found %d.\n", len(zones))
 
-    fmt.Printf("Reading areas... ")
+    fmt.Printf("Reading areas...\n")
     for i := 1; i < (config.MaxAreas + 1); i++ { 
         paradoxSendAndWait(config, s, fmt.Sprintf("AL%03d", i), &areas, &users, &zones)
         paradoxSendAndWait(config, s, fmt.Sprintf("RA%03d", i), &areas, &users, &zones)
@@ -275,12 +333,13 @@ func main() {
     for _, area_info := range areas {
 	fmt.Printf("'%s'\n", area_info.Name)
     }
-    fmt.Printf("\n")
 
-    fmt.Printf("Reading users...\n")
+    fmt.Printf("Reading users... ")
     for i := 1; i < (config.MaxUsers + 1); i++ { 
         paradoxSendAndWait(config, s, fmt.Sprintf("UL%03d", i), &areas, &users, &zones)
     }
+    fmt.Printf("found %d.\n", len(users))
+    config.Startup = false
  
     s.Close()
     time.Sleep(500 * time.Millisecond)
