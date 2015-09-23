@@ -10,9 +10,11 @@ import (
     "strings"
     "io/ioutil"
     "encoding/json"
-    "net/http"
     "gopkg.in/yaml.v2"
     "github.com/tarm/goserial"
+    "os/exec"
+    "net/http"
+    "crypto/tls"
 )
 
 type Config struct {
@@ -25,9 +27,10 @@ type Config struct {
         Debug bool `yaml:"debug"`
         Startup bool 
         Webhooks[] struct {
-            Event string
-            Description string
-            Url string
+            Event string `yaml:"event"`
+            Description string `yaml:"description"`
+            Url string `yaml:"url"`
+            Execute string `yaml:"execute"`
         } `yaml:"webhooks"`
         Macros[] struct {
             Name string
@@ -153,8 +156,36 @@ func emitEvent(config Config, event string, name string, label string) {
     }
     for _,webhook := range config.Webhooks {
         match, _ := regexp.MatchString(webhook.Event, event)
-        if match && !config.Startup {
-            fmt.Printf("%s Match: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), replaceMacros(config, webhook.Description, event, name, label))
+        if match {
+            if !config.Startup {
+                fmt.Printf("%s hook: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), replaceMacros(config, webhook.Description, event, name, label))
+            }
+            if webhook.Execute != "" {
+                cmd := replaceMacros(config, webhook.Execute, event, name, label)
+                if !config.Startup && config.Debug {
+                    fmt.Printf("%s execute: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), cmd)
+                }
+                go func() {
+                    out, _ := exec.Command("sh","-c",cmd).Output()
+                    if !config.Startup && config.Debug {
+                        fmt.Printf("%s result: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), out)
+                    }
+                }()
+            }
+            if webhook.Url != "" {
+                url := replaceMacros(config, webhook.Url, event, name, label)
+                if !config.Startup && config.Debug {
+                    fmt.Printf("%s calling: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), url)
+                }
+                go func() {
+                    tr := &http.Transport{ TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, }
+                    client := &http.Client{Transport: tr}
+                    _, err := client.Get(url)
+                    if err != nil {
+                        fmt.Printf("%s error: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), err)
+                    }
+                }()
+            }
         }
     }
 }
