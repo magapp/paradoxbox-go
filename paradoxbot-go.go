@@ -19,6 +19,7 @@ import (
 
 type Config struct {
         Port string `yaml:"paradox_port"`
+        WirePath string `yaml:"wire_path"`
         Baud int `yaml:"paradox_baud"`
         TcpPort int `yaml:"tcp_port"`
         MaxUsers int `yaml:"max_users"`
@@ -94,6 +95,20 @@ func httpStatusZone(w http.ResponseWriter, r *http.Request, zones map[string]Zon
     w.Header().Set("Content-Type", "application/json")
     jsonString, err := json.Marshal(zones)
     check(err)
+    fmt.Fprintf(w, "%s", jsonString)
+}
+
+func httpStatusTemperature(w http.ResponseWriter, r *http.Request, config Config) {
+    // format = /temperature?sensor=<path>
+    w.Header().Set("Content-Type", "application/json")
+    file, err := os.Open(config.WirePath + "/" + strings.Split(r.RequestURI, "?sensor=")[1])
+    check(err)
+    data := make([]byte, 100)
+    count, err := file.Read(data)
+    check(err)
+    response := make(map[string]string)
+    response["temperature"] = strings.TrimSpace(string(data[:count]))
+    jsonString, err := json.Marshal(response)
     fmt.Fprintf(w, "%s", jsonString)
 }
 
@@ -180,10 +195,12 @@ func emitEvent(config Config, event string, name string, label string) {
                 go func() {
                     tr := &http.Transport{ TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, }
                     client := &http.Client{Transport: tr}
-                    _, err := client.Get(url)
+                    respone, err := client.Get(url)
                     if err != nil {
                         fmt.Printf("%s error: '%s'\n", time.Now().Format("2006-01-02 15:04:05"), err)
                     }
+                    defer respone.Body.Close()
+                    ioutil.ReadAll(respone.Body)
                 }()
             }
         }
@@ -408,6 +425,9 @@ func main() {
     })
     http.HandleFunc("/status-zone", func(w http.ResponseWriter, r *http.Request) {
         httpStatusZone(w, r, zones)
+    })
+    http.HandleFunc("/temperature", func(w http.ResponseWriter, r *http.Request) {
+        httpStatusTemperature(w, r, config)
     })
     err = http.ListenAndServe(fmt.Sprint(":", config.TcpPort), nil)
     check(err)
